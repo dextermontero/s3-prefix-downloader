@@ -1,0 +1,5 @@
+# One S3 prefix per line. Blank lines and #-comments are ignored.
+uploads/reports/2026/01
+uploads/reports/2026/02
+exports/invoices/q1
+backups/database/daily

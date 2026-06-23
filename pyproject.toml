@@ -1,0 +1,11 @@
+[project]
+name = "s3-prefix-downloader"
+version = "0.1.0"
+description = "Concurrent, resumable bulk downloader for S3 & MinIO — mirror every object under a set of prefixes to local disk."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "boto3>=1.43.36",
+    "psutil>=7.2.2",
+    "python-dotenv>=1.2.2",
+]
