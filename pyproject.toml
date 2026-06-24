@@ -8,4 +8,5 @@ dependencies = [
     "boto3>=1.43.36",
     "psutil>=7.2.2",
     "python-dotenv>=1.2.2",
+    "smbprotocol>=1.15.0",
 ]

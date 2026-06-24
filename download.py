@@ -1,5 +1,5 @@
 """Concurrently download all objects under one or more S3 prefixes,
-preserving the directory structure locally.
+preserving the directory structure locally or on a NAS (SMB/CIFS).
 
 The worker pool is sized automatically from the machine's available CPU and
 RAM so the laptop stays responsive (won't hang) during large transfers.
@@ -11,17 +11,21 @@ Usage:
     # or read prefixes from a file (one per line)
     uv run download.py --prefixes-file prefixes.txt
 
+    # write directly to NAS (fill NAS_* vars in .env first)
+    uv run download.py --prefixes-file prefixes.txt --nas
+
     # override the auto-picked worker count / destination / bucket
     uv run download.py uploads/archive/Tabloid/2026/06 --workers 8 --dest ./downloads --bucket my-bucket
 
-Each object key is mirrored under LOCAL_DIR, e.g.
+Each object key is mirrored under the destination, e.g.
     uploads/archive/Tabloid/2026/06/file.pdf
-  -> <LOCAL_DIR>/uploads/archive/Tabloid/2026/06/file.pdf
+  -> <dest>/uploads/archive/Tabloid/2026/06/file.pdf
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 import threading
@@ -34,6 +38,20 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
+from smbprotocol.connection import Connection
+from smbprotocol.session import Session
+from smbprotocol.tree import TreeConnect
+from smbprotocol import open as smb_open
+from smbprotocol.open import (
+    CreateDisposition,
+    CreateOptions,
+    FileAttributes,
+    FilePipePrinterAccessMask,
+    ImpersonationLevel,
+    Open,
+    ShareAccess,
+)
+import uuid
 
 load_dotenv()
 
@@ -62,6 +80,112 @@ ARCHIVED_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
 
 # boto3 clients are not thread-safe, so give each worker thread its own client.
 _local = threading.local()
+
+# ---------------------------------------------------------------------------
+# NAS (SMB/CIFS) support
+# ---------------------------------------------------------------------------
+
+class NASWriter:
+    """Write files directly to an SMB share without mounting.
+
+    One instance is shared across all threads; smbprotocol's Open objects are
+    created per-write so there is no shared mutable state.
+    """
+
+    def __init__(self, host: str, user: str, password: str, share: str, nas_path: str = ""):
+        self.host = host
+        self.share = share
+        self.base = nas_path.strip("/")
+
+        self._conn = Connection(uuid.uuid4(), host, 445)
+        self._conn.connect()
+        self._session = Session(self._conn, user, password)
+        self._session.connect()
+        self._tree = TreeConnect(self._session, f"\\\\{host}\\{share}")
+        self._tree.connect()
+
+    def close(self):
+        try:
+            self._tree.disconnect()
+            self._session.disconnect()
+            self._conn.disconnect()
+        except Exception:
+            pass
+
+    def _smb_path(self, key: str) -> str:
+        parts = [self.base, key] if self.base else [key]
+        return "\\".join("/".join(parts).replace("/", "\\").split("\\"))
+
+    def exists_with_size(self, key: str, expected_size: int) -> bool:
+        path = self._smb_path(key)
+        try:
+            f = Open(self._tree, path)
+            info = f.query_info(
+                info_type=1,  # FILE_INFO
+                file_info_class=5,  # FileStandardInformation
+            )
+            f.close(False)
+            # FileStandardInformation: EndOfFile is at offset 8, 8 bytes (int64)
+            size = int.from_bytes(info[8:16], "little")
+            return size == expected_size
+        except Exception:
+            return False
+
+    def _make_dirs(self, smb_dir: str):
+        parts = smb_dir.split("\\")
+        for i in range(1, len(parts) + 1):
+            partial = "\\".join(parts[:i])
+            if not partial:
+                continue
+            try:
+                f = Open(
+                    self._tree,
+                    partial,
+                    desired_access=FilePipePrinterAccessMask.GENERIC_READ,
+                    file_attributes=FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+                    share_access=ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
+                    create_disposition=CreateDisposition.FILE_OPEN_IF,
+                    create_options=CreateOptions.FILE_DIRECTORY_FILE,
+                    impersonation_level=ImpersonationLevel.Impersonation,
+                )
+                f.create(self._session, self._tree)
+                f.close(False)
+            except Exception:
+                pass  # already exists or not a dir error — proceed
+
+    def write(self, key: str, data: bytes):
+        path = self._smb_path(key)
+        smb_dir = "\\".join(path.split("\\")[:-1])
+        if smb_dir:
+            self._make_dirs(smb_dir)
+        f = Open(
+            self._tree,
+            path,
+            desired_access=(
+                FilePipePrinterAccessMask.GENERIC_WRITE
+                | FilePipePrinterAccessMask.GENERIC_READ
+            ),
+            file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            share_access=ShareAccess.FILE_SHARE_READ,
+            create_disposition=CreateDisposition.FILE_SUPERSEDE,
+            create_options=CreateOptions.FILE_NON_DIRECTORY_FILE,
+            impersonation_level=ImpersonationLevel.Impersonation,
+        )
+        f.create(self._session, self._tree)
+        f.write(data, 0)
+        f.close(False)
+
+
+def make_nas_writer() -> NASWriter:
+    host = os.getenv("NAS_HOST", "")
+    user = os.getenv("NAS_USER", "")
+    password = os.getenv("NAS_PASSWORD", "")
+    share = os.getenv("NAS_SHARE", "")
+    nas_path = os.getenv("NAS_PATH", "")
+    missing = [k for k, v in [("NAS_HOST", host), ("NAS_USER", user), ("NAS_PASSWORD", password), ("NAS_SHARE", share)] if not v]
+    if missing:
+        raise SystemExit(f"--nas requires these .env vars to be set: {', '.join(missing)}")
+    return NASWriter(host, user, password, share, nas_path)
 
 
 def make_client():
@@ -162,25 +286,31 @@ def download_one(
     restore: bool,
     restore_days: int,
     restore_tier: str,
+    nas: NASWriter | None = None,
 ) -> tuple[str, int]:
     """Download a single object. Resumable + crash-safe + archive-aware.
 
     Returns (status, bytes). Status is one of:
       downloaded | skipped | restoring | restore-requested | archived
 
-    - Skips the file if it already exists locally with the same size as the
-      remote object (so re-running after a crash won't re-pull what's done).
+    When `nas` is provided, the file is written directly to the SMB share
+    instead of local disk. Skip detection checks the NAS file size in that case.
+
+    - Skips the file if it already exists at the destination with the same size
+      as the remote object (so re-running after a crash won't re-pull what's done).
     - For GLACIER / DEEP_ARCHIVE objects, an object must be restored before it
       can be downloaded. We check restore state and, with --restore, kick off a
       restore request. Once restored, a later run downloads it normally.
-    - Downloads to a temporary "<name>.part" file and atomically renames it
-      into place only after the full transfer succeeds. An interrupted run
-      therefore never leaves a corrupt file at the real path: the stale .part
-      is simply overwritten next time.
+    - Local mode downloads to a temporary "<name>.part" file and atomically
+      renames it into place only after the full transfer succeeds.
     """
-    target = dest / key
-    if not overwrite and target.exists() and target.stat().st_size == size:
-        return "skipped", target.stat().st_size
+    if nas is not None:
+        if not overwrite and nas.exists_with_size(key, size):
+            return "skipped", size
+    else:
+        target = dest / key
+        if not overwrite and target.exists() and target.stat().st_size == size:
+            return "skipped", target.stat().st_size
 
     client = get_client()
 
@@ -202,6 +332,15 @@ def download_one(
             return "restore-requested", 0
         # state == "available": fall through and download the staged copy.
 
+    if nas is not None:
+        # Stream the object into memory then write to NAS in one shot.
+        buf = io.BytesIO()
+        get_client().download_fileobj(bucket, key, buf, Config=TRANSFER)
+        data = buf.getvalue()
+        nas.write(key, data)
+        return "downloaded", len(data)
+
+    target = dest / key
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".part")
     try:
@@ -262,6 +401,12 @@ def main() -> int:
         help="Glacier retrieval tier (default: Standard). Expedited is NOT "
         "supported for DEEP_ARCHIVE.",
     )
+    parser.add_argument(
+        "--nas",
+        action="store_true",
+        help="Write files directly to the NAS (SMB/CIFS). "
+        "Requires NAS_HOST, NAS_USER, NAS_PASSWORD, NAS_SHARE in .env.",
+    )
     args = parser.parse_args()
 
     # Normalize "pdf, .JPG" -> (".pdf", ".jpg"); empty means "all files".
@@ -279,9 +424,18 @@ def main() -> int:
     if not args.bucket:
         parser.error("No bucket given. Pass --bucket or set S3_BUCKET in your .env")
 
+    nas_writer: NASWriter | None = None
+    if args.nas:
+        print("Connecting to NAS...")
+        nas_writer = make_nas_writer()
+        nas_dest = f"\\\\{os.getenv('NAS_HOST')}\\{os.getenv('NAS_SHARE')}"
+        if os.getenv("NAS_PATH"):
+            nas_dest += f"\\{os.getenv('NAS_PATH').strip('/')}"
+        print(f"NAS    : {nas_dest}")
+
     dest = Path(args.dest).expanduser().resolve()
     print(f"Bucket : {args.bucket}")
-    print(f"Dest   : {dest}")
+    print(f"Dest   : {'NAS (see above)' if args.nas else dest}")
     print(f"Filter : {', '.join(extensions) if extensions else 'all files'}")
     print(f"Prefixes ({len(prefixes)}):")
     for p in prefixes:
@@ -332,6 +486,7 @@ def main() -> int:
             args.restore,
             args.restore_days,
             args.restore_tier,
+            nas_writer,
         ): key
         for key, size, storage_class in objects
     }
@@ -402,6 +557,9 @@ def main() -> int:
             print(f"  - {key}: {msg}", file=sys.stderr)
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more", file=sys.stderr)
+
+    if nas_writer is not None:
+        nas_writer.close()
 
     if interrupted:
         print("Re-run the same command to resume — already-downloaded files are skipped.")

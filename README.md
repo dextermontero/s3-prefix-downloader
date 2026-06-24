@@ -8,6 +8,8 @@ It is built to be safe on a laptop: the worker pool is sized from your available
 CPU and RAM (so it won't hang or OOM), downloads are **resumable**, and an
 interrupt or crash never leaves a corrupted file behind. Objects sitting in
 **Glacier / Deep Archive** are detected and can be restored with a single flag.
+Files can be saved to **local disk** (default) or written directly to a **NAS
+over SMB/CIFS** with `--nas` — no mounting or `sudo` required.
 
 ---
 
@@ -34,10 +36,22 @@ LOCAL_DIR=./downloads
 # MinIO only — leave blank for AWS S3.
 # e.g. http://localhost:9000
 S3_ENDPOINT_URL=
+
+# NAS (SMB/CIFS) — only needed when using --nas
+NAS_HOST=192.168.1.100
+NAS_USER=admin
+NAS_PASSWORD=your-nas-password
+NAS_SHARE=shared
+# Path inside the share where files land (leave blank for share root)
+NAS_PATH=/downloads
 ```
 
 For **MinIO**, set `S3_ENDPOINT_URL` to your server URL; the tool automatically
 switches to path-style addressing. For **AWS S3**, leave it blank.
+
+For **NAS**, fill in the five `NAS_*` variables and pass `--nas` at runtime
+(see [NAS / SMB usage](#nas--smb-usage) below). The connection uses pure-Python
+SMB via `smbprotocol` — no `mount` command, no `sudo`, no `cifs-utils` needed.
 
 ---
 
@@ -70,6 +84,22 @@ uv run download.py --prefixes-file prefixes.txt --restore
 uv run download.py --prefixes-file prefixes.txt --restore --restore-tier Bulk --restore-days 14
 ```
 
+### NAS / SMB usage
+
+Fill in the `NAS_*` variables in `.env`, then add `--nas`:
+
+```bash
+# write directly to NAS instead of local disk
+uv run download.py --prefixes-file prefixes.txt --nas
+
+# --nas works with all other flags
+uv run download.py --prefixes-file prefixes.txt --nas --ext pdf --workers 8
+uv run download.py --prefixes-file prefixes.txt --nas --overwrite
+```
+
+Without `--nas` the tool behaves exactly as before — nothing changes for local
+downloads.
+
 ### `prefixes.txt`
 
 One S3 prefix per line. Blank lines and `#` comments are ignored:
@@ -91,10 +121,11 @@ You can list as many prefixes as you need — see [Scaling](#scaling-how-many-pr
 | `prefixes` | One or more S3 key prefixes (positional). |
 | `--prefixes-file PATH` | Read prefixes from a file, one per line (`#` comments ok). |
 | `--bucket NAME` | Bucket name. Defaults to `S3_BUCKET` from `.env`. |
-| `--dest DIR` | Local download root. Defaults to `LOCAL_DIR` or `./downloads`. |
+| `--dest DIR` | Local download root. Defaults to `LOCAL_DIR` or `./downloads`. Ignored when `--nas` is used. |
 | `--workers N` | Override the auto-picked concurrency (clamped to 32). |
-| `--overwrite` | Re-download every file even if a same-size local copy exists. |
+| `--overwrite` | Re-download every file even if a same-size copy already exists at the destination. |
 | `--ext EXTS` | Only download files with these extensions, comma-separated (e.g. `pdf` or `pdf,jpg`). **Omit to download everything.** |
+| `--nas` | Write files directly to the NAS over SMB/CIFS. Requires `NAS_HOST`, `NAS_USER`, `NAS_PASSWORD`, `NAS_SHARE` in `.env`. |
 | `--restore` | For GLACIER / DEEP_ARCHIVE objects, initiate a restore so they can be downloaded on a later run. Without it, archived objects are reported and skipped. |
 | `--restore-days N` | How many days a restored copy stays available (default: `7`). |
 | `--restore-tier TIER` | Glacier retrieval tier: `Standard` (default), `Bulk`, or `Expedited`. **`Expedited` is not supported for DEEP_ARCHIVE.** |
@@ -183,7 +214,26 @@ less in practice), not `workers × 10 × 8 MB`.
 
 Use `--workers N` to override (still clamped to the hard cap of 32).
 
-### 6. Resumable — already-downloaded files are skipped
+### 6. NAS / SMB — direct write without mounting
+
+When `--nas` is passed, files are written directly to the SMB share using
+[`smbprotocol`](https://github.com/jborean93/smbprotocol) — a pure-Python SMB
+implementation. **No `mount`, no `sudo`, no `cifs-utils`** are required.
+
+The directory tree is recreated inside the share exactly as it would be on local
+disk. The remote path is built from `NAS_PATH` (if set) + the S3 object key:
+
+```
+NAS_SHARE=shared  NAS_PATH=/downloads
+S3 key: uploads/archive/Tabloid/2026/06/16/Front Page/1/x.png
+
+→ \\NAS_HOST\shared\downloads\uploads\archive\Tabloid\2026\06\16\Front Page\1\x.png
+```
+
+The skip check (resume) compares the S3 object size against the existing file
+size on the NAS, so re-running with `--nas` is just as safe as a local re-run.
+
+### 7. Resumable — already-downloaded files are skipped
 
 Before downloading, each file is skipped if a local copy already exists **with
 the same byte size** as the remote object. So if a run is interrupted, just
@@ -194,7 +244,7 @@ force a fresh download of everything.
 > replaced by a different file of the exact same byte count, it will be skipped.
 > This is rare; use `--overwrite` if your archive mutates files in place.
 
-### 7. Crash-safe — no corrupt files
+### 8. Crash-safe — no corrupt files
 
 Each file downloads to a temporary `<name>.part` and is **atomically renamed**
 into place only after the full transfer succeeds. Therefore:
@@ -205,7 +255,7 @@ into place only after the full transfer succeeds. Therefore:
   what makes the size-based resume check safe.
 - Stale `.part` files are simply overwritten on the next run.
 
-### 8. Archive-aware (Glacier / Deep Archive)
+### 9. Archive-aware (Glacier / Deep Archive)
 
 Objects in the `GLACIER` or `DEEP_ARCHIVE` storage classes can't be downloaded
 directly — S3 must **restore** them to a temporary staging copy first.
@@ -230,7 +280,7 @@ For each archived object the tool checks its restore state and reports it:
   selects the retrieval speed/cost (`Standard`, `Bulk`, `Expedited` — the last
   not valid for Deep Archive).
 
-### 9. Graceful interrupts & error handling
+### 10. Graceful interrupts & error handling
 
 - **Ctrl+C** prints a clean summary, cancels queued downloads (doesn't wait for
   the long tail), and exits `130`. It never prints a raw traceback. Re-run to
