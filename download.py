@@ -11,8 +11,17 @@ Usage:
     # or read prefixes from a file (one per line)
     uv run download.py --prefixes-file prefixes.txt
 
+    # transfer a single specific file (or a few) by exact key
+    uv run download.py --file uploads/archive/Broadsheet/2026/06/01/paper/file.pdf --minio
+
     # write directly to NAS (fill NAS_* vars in .env first)
     uv run download.py --prefixes-file prefixes.txt --nas
+
+    # mirror directly into MinIO (fill MINIO_* vars in .env first)
+    uv run download.py --prefixes-file prefixes.txt --minio
+
+    # preview what would transfer to MinIO without touching anything
+    uv run download.py --prefixes-file prefixes.txt --minio --dry-run
 
     # override the auto-picked worker count / destination / bucket
     uv run download.py uploads/archive/Tabloid/2026/06 --workers 8 --dest ./downloads --bucket my-bucket
@@ -189,7 +198,7 @@ def make_nas_writer() -> NASWriter:
 
 
 def make_client():
-    """Build an S3 client. Works for AWS S3 and MinIO (via S3_ENDPOINT_URL)."""
+    """Build an S3 source client. Works for AWS S3 and MinIO (via S3_ENDPOINT_URL)."""
     endpoint = os.getenv("S3_ENDPOINT_URL") or None
     return boto3.client(
         "s3",
@@ -205,11 +214,52 @@ def make_client():
 
 
 def get_client():
-    """Return this thread's S3 client, creating it on first use."""
+    """Return this thread's S3 source client, creating it on first use."""
     client = getattr(_local, "client", None)
     if client is None:
         client = _local.client = make_client()
     return client
+
+
+# ---------------------------------------------------------------------------
+# MinIO destination support
+# ---------------------------------------------------------------------------
+
+_minio_local = threading.local()
+
+
+def make_minio_client():
+    """Build a boto3 client pointed at the MinIO destination."""
+    endpoint = os.getenv("MINIO_ENDPOINT_URL", "")
+    if not endpoint:
+        raise SystemExit("--minio requires MINIO_ENDPOINT_URL in .env")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("MINIO_SECRET_ACCESS_KEY"),
+        config=Config(
+            max_pool_connections=HARD_CAP + 4,
+            s3={"addressing_style": "path"},
+        ),
+    )
+
+
+def get_minio_client():
+    """Return this thread's MinIO client, creating it on first use."""
+    client = getattr(_minio_local, "client", None)
+    if client is None:
+        client = _minio_local.client = make_minio_client()
+    return client
+
+
+def minio_exists_with_size(key: str, bucket: str, expected_size: int) -> bool:
+    """Return True if the object already exists in MinIO with the same size."""
+    try:
+        resp = get_minio_client().head_object(Bucket=bucket, Key=key)
+        return resp["ContentLength"] == expected_size
+    except ClientError:
+        return False
 
 
 def auto_workers(requested: int | None) -> int:
@@ -287,24 +337,26 @@ def download_one(
     restore_days: int,
     restore_tier: str,
     nas: NASWriter | None = None,
+    minio_bucket: str | None = None,
 ) -> tuple[str, int]:
     """Download a single object. Resumable + crash-safe + archive-aware.
 
     Returns (status, bytes). Status is one of:
       downloaded | skipped | restoring | restore-requested | archived
 
-    When `nas` is provided, the file is written directly to the SMB share
-    instead of local disk. Skip detection checks the NAS file size in that case.
+    Destination priority (mutually exclusive flags):
+      --minio  → stream source S3 object directly into MinIO; no local file.
+      --nas    → stream into memory and write to SMB share; no local file.
+      default  → download to local disk with atomic .part-file rename.
 
-    - Skips the file if it already exists at the destination with the same size
-      as the remote object (so re-running after a crash won't re-pull what's done).
-    - For GLACIER / DEEP_ARCHIVE objects, an object must be restored before it
-      can be downloaded. We check restore state and, with --restore, kick off a
-      restore request. Once restored, a later run downloads it normally.
-    - Local mode downloads to a temporary "<name>.part" file and atomically
-      renames it into place only after the full transfer succeeds.
+    Skip detection queries the actual destination (MinIO head_object, NAS file
+    size, or local stat) so re-runs are safe and idempotent everywhere.
     """
-    if nas is not None:
+    # --- skip check ---
+    if minio_bucket is not None:
+        if not overwrite and minio_exists_with_size(key, minio_bucket, size):
+            return "skipped", size
+    elif nas is not None:
         if not overwrite and nas.exists_with_size(key, size):
             return "skipped", size
     else:
@@ -332,8 +384,16 @@ def download_one(
             return "restore-requested", 0
         # state == "available": fall through and download the staged copy.
 
+    # --- transfer ---
+    if minio_bucket is not None:
+        # Stream source → in-memory buffer → MinIO. No local file touched.
+        buf = io.BytesIO()
+        get_client().download_fileobj(bucket, key, buf, Config=TRANSFER)
+        buf.seek(0)
+        get_minio_client().upload_fileobj(buf, minio_bucket, key, Config=TRANSFER)
+        return "downloaded", size
+
     if nas is not None:
-        # Stream the object into memory then write to NAS in one shot.
         buf = io.BytesIO()
         get_client().download_fileobj(bucket, key, buf, Config=TRANSFER)
         data = buf.getvalue()
@@ -347,10 +407,36 @@ def download_one(
         get_client().download_file(bucket, key, str(tmp), Config=TRANSFER)
         os.replace(tmp, target)  # atomic on the same filesystem
     except BaseException:
-        # Clean up the partial file so it can't be mistaken for valid later.
         tmp.unlink(missing_ok=True)
         raise
     return "downloaded", target.stat().st_size
+
+
+def dry_run_one(
+    key: str,
+    size: int,
+    overwrite: bool,
+    dest: Path,
+    nas: NASWriter | None,
+    minio_bucket: str | None,
+) -> tuple[str, int, str, bool]:
+    """Check whether the object already exists at the destination.
+
+    Returns (key, size, dest_url, would_skip). Nothing is downloaded or uploaded.
+    dest_url is the fully-resolved path / URL the object would land at.
+    """
+    if minio_bucket is not None:
+        endpoint = os.getenv("MINIO_ENDPOINT_URL", "").rstrip("/")
+        dest_url = f"{endpoint}/{minio_bucket}/{key}"
+        would_skip = not overwrite and minio_exists_with_size(key, minio_bucket, size)
+    elif nas is not None:
+        dest_url = "\\\\" + os.getenv("NAS_HOST", "") + "\\" + os.getenv("NAS_SHARE", "") + "\\" + nas._smb_path(key)
+        would_skip = not overwrite and nas.exists_with_size(key, size)
+    else:
+        target = dest / key
+        dest_url = str(target)
+        would_skip = not overwrite and target.exists() and target.stat().st_size == size
+    return key, size, dest_url, would_skip
 
 
 def main() -> int:
@@ -359,6 +445,16 @@ def main() -> int:
     )
     parser.add_argument("prefixes", nargs="*", help="One or more S3 key prefixes.")
     parser.add_argument("--prefixes-file", help="Path to a file with one prefix per line.")
+    parser.add_argument(
+        "--file",
+        dest="files",
+        metavar="KEY",
+        action="append",
+        default=[],
+        help="Transfer a single object by its exact S3 key. "
+        "Can be repeated: --file key1 --file key2. "
+        "Mutually exclusive with prefix arguments.",
+    )
     parser.add_argument("--bucket", default=os.getenv("S3_BUCKET"), help="Bucket name (or set S3_BUCKET).")
     parser.add_argument(
         "--dest",
@@ -407,7 +503,23 @@ def main() -> int:
         help="Write files directly to the NAS (SMB/CIFS). "
         "Requires NAS_HOST, NAS_USER, NAS_PASSWORD, NAS_SHARE in .env.",
     )
+    parser.add_argument(
+        "--minio",
+        action="store_true",
+        help="Mirror objects directly into MinIO (no local copy). "
+        "Requires MINIO_ENDPOINT_URL, MINIO_ACCESS_KEY_ID, MINIO_SECRET_ACCESS_KEY, "
+        "MINIO_BUCKET in .env.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be transferred and print each destination URL without "
+        "downloading or uploading anything. Works with --minio, --nas, and local mode.",
+    )
     args = parser.parse_args()
+
+    if args.nas and args.minio:
+        parser.error("--nas and --minio are mutually exclusive. Pick one destination.")
 
     # Normalize "pdf, .JPG" -> (".pdf", ".jpg"); empty means "all files".
     extensions = tuple(
@@ -419,8 +531,10 @@ def main() -> int:
         text = Path(args.prefixes_file).read_text()
         prefixes += [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
 
-    if not prefixes:
-        parser.error("No prefixes given. Pass them as arguments or via --prefixes-file.")
+    if args.files and prefixes:
+        parser.error("--file and prefix arguments are mutually exclusive. Use one or the other.")
+    if not prefixes and not args.files:
+        parser.error("No prefixes given. Pass them as arguments, via --prefixes-file, or use --file KEY.")
     if not args.bucket:
         parser.error("No bucket given. Pass --bucket or set S3_BUCKET in your .env")
 
@@ -433,9 +547,26 @@ def main() -> int:
             nas_dest += f"\\{os.getenv('NAS_PATH').strip('/')}"
         print(f"NAS    : {nas_dest}")
 
+    minio_bucket: str | None = None
+    if args.minio:
+        minio_bucket = os.getenv("MINIO_BUCKET", "")
+        if not minio_bucket:
+            parser.error("--minio requires MINIO_BUCKET in .env")
+        # Validate credentials by attempting a connection now, not mid-transfer.
+        try:
+            make_minio_client().list_buckets()
+        except Exception as exc:
+            raise SystemExit(f"Cannot connect to MinIO: {exc}") from exc
+        print(f"MinIO  : {os.getenv('MINIO_ENDPOINT_URL')}  bucket={minio_bucket}")
+
     dest = Path(args.dest).expanduser().resolve()
-    print(f"Bucket : {args.bucket}")
-    print(f"Dest   : {'NAS (see above)' if args.nas else dest}")
+    print(f"Source : {args.bucket}")
+    if args.minio:
+        print(f"Dest   : MinIO → {minio_bucket}")
+    elif args.nas:
+        print(f"Dest   : NAS (see above)")
+    else:
+        print(f"Dest   : {dest}")
     print(f"Filter : {', '.join(extensions) if extensions else 'all files'}")
     print(f"Prefixes ({len(prefixes)}):")
     for p in prefixes:
@@ -446,8 +577,22 @@ def main() -> int:
     print()
 
     try:
-        print("Listing objects...")
-        objects = list_objects(prefixes, args.bucket, extensions)
+        if args.files:
+            print(f"Resolving {len(args.files)} explicit file(s)...")
+            client = make_client()
+            objects: list[tuple[str, int, str]] = []
+            for key in args.files:
+                try:
+                    head = client.head_object(Bucket=args.bucket, Key=key)
+                    size = head["ContentLength"]
+                    storage_class = head.get("StorageClass", "STANDARD")
+                    objects.append((key, size, storage_class))
+                    print(f"  found: {key} ({size:,} B, {storage_class})")
+                except ClientError as exc:
+                    print(f"  not found: {key}  ({exc})", file=sys.stderr)
+        else:
+            print("Listing objects...")
+            objects = list_objects(prefixes, args.bucket, extensions)
     except (BotoCoreError, ClientError) as exc:
         print(f"\nError listing objects: {exc}", file=sys.stderr)
         return 1
@@ -462,6 +607,53 @@ def main() -> int:
         return 0
 
     total_bytes = sum(size for _, size, _ in objects)
+
+    if args.dry_run:
+        print(f"\nDry run — {total} object(s) found (~{total_bytes/1024**2:.1f} MiB). "
+              f"Checking destinations with {workers} workers...\n")
+        would_transfer = 0
+        would_skip = 0
+        transfer_bytes = 0
+        dr_lock = threading.Lock()
+        dr_done = 0
+
+        dr_pool = ThreadPoolExecutor(max_workers=workers)
+        dr_futures = {
+            dr_pool.submit(dry_run_one, key, size, args.overwrite, dest, nas_writer, minio_bucket): key
+            for key, size, _ in objects
+        }
+        try:
+            for fut in as_completed(dr_futures):
+                key, size, dest_url, skipping = fut.result()
+                with dr_lock:
+                    dr_done += 1
+                    if skipping:
+                        would_skip += 1
+                        print(f"[{dr_done}/{total}] = {key} ({size:,} B, already present — skip)")
+                    else:
+                        would_transfer += 1
+                        transfer_bytes += size
+                        print(f"[{dr_done}/{total}] → {key} ({size:,} B)")
+                    print(f"             {dest_url}")
+        except KeyboardInterrupt:
+            dr_pool.shutdown(wait=False, cancel_futures=True)
+            print("\nDry run interrupted.")
+            if nas_writer is not None:
+                nas_writer.close()
+            return 130
+        else:
+            dr_pool.shutdown(wait=True)
+
+        print(
+            f"\nDry run complete. "
+            f"{would_transfer} would transfer (~{transfer_bytes/1024**2:.1f} MiB), "
+            f"{would_skip} already present (would skip), "
+            f"{total} total."
+        )
+        if nas_writer is not None:
+            nas_writer.close()
+        return 0
+
     print(f"\nDownloading {total} file(s), ~{total_bytes/1024**2:.1f} MiB, with {workers} workers...\n")
 
     done = 0
@@ -487,6 +679,7 @@ def main() -> int:
             args.restore_days,
             args.restore_tier,
             nas_writer,
+            minio_bucket,
         ): key
         for key, size, storage_class in objects
     }
@@ -535,11 +728,16 @@ def main() -> int:
     else:
         pool.shutdown(wait=True)
 
+    dest_label = (
+        f"MinIO:{minio_bucket}" if minio_bucket
+        else f"NAS:{nas_dest}" if nas_writer
+        else str(dest)
+    )
     print(
         f"\n{'Stopped' if interrupted else 'Done'}. "
         f"{downloaded} downloaded, {skipped} skipped, {archived} archived, "
         f"{len(errors)} failed of {total} total. "
-        f"{bytes_done/1024**2:.1f} MiB transferred into {dest}"
+        f"{bytes_done/1024**2:.1f} MiB transferred into {dest_label}"
     )
     if archived:
         print(

@@ -8,8 +8,9 @@ It is built to be safe on a laptop: the worker pool is sized from your available
 CPU and RAM (so it won't hang or OOM), downloads are **resumable**, and an
 interrupt or crash never leaves a corrupted file behind. Objects sitting in
 **Glacier / Deep Archive** are detected and can be restored with a single flag.
-Files can be saved to **local disk** (default) or written directly to a **NAS
-over SMB/CIFS** with `--nas` — no mounting or `sudo` required.
+Files can be saved to **local disk** (default), written directly to a **NAS
+over SMB/CIFS** with `--nas`, or mirrored straight into a **MinIO instance**
+with `--minio` — no intermediate local copy needed for either remote destination.
 
 ---
 
@@ -25,6 +26,7 @@ cp .env.example .env    # then fill in your credentials + bucket
 ### Configure `.env`
 
 ```ini
+# Source — AWS S3
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_REGION=ap-southeast-1
@@ -33,9 +35,15 @@ S3_BUCKET=your-bucket-name
 # Local directory to download into (structure is preserved under it)
 LOCAL_DIR=./downloads
 
-# MinIO only — leave blank for AWS S3.
+# Source via MinIO / self-hosted S3 — leave blank for AWS S3
 # e.g. http://localhost:9000
 S3_ENDPOINT_URL=
+
+# MinIO destination — only needed when using --minio
+MINIO_ENDPOINT_URL=https://minio.example.com
+MINIO_ACCESS_KEY_ID=your-minio-access-key
+MINIO_SECRET_ACCESS_KEY=your-minio-secret-key
+MINIO_BUCKET=your-minio-bucket
 
 # NAS (SMB/CIFS) — only needed when using --nas
 NAS_HOST=192.168.1.100
@@ -46,12 +54,19 @@ NAS_SHARE=shared
 NAS_PATH=/downloads
 ```
 
-For **MinIO**, set `S3_ENDPOINT_URL` to your server URL; the tool automatically
-switches to path-style addressing. For **AWS S3**, leave it blank.
+For **AWS S3 source**, leave `S3_ENDPOINT_URL` blank. For a **MinIO / self-hosted
+source**, set `S3_ENDPOINT_URL` to your server URL.
 
-For **NAS**, fill in the five `NAS_*` variables and pass `--nas` at runtime
-(see [NAS / SMB usage](#nas--smb-usage) below). The connection uses pure-Python
-SMB via `smbprotocol` — no `mount` command, no `sudo`, no `cifs-utils` needed.
+For the **MinIO destination** (`--minio`), fill in the four `MINIO_*` variables.
+Objects are streamed source → MinIO with no local copy; the existing object is
+skipped if it already exists in MinIO with the same byte size.
+
+For the **NAS destination** (`--nas`), fill in the five `NAS_*` variables. The
+connection uses pure-Python SMB via `smbprotocol` — no `mount`, no `sudo`, no
+`cifs-utils` needed.
+
+`--nas` and `--minio` are mutually exclusive. Without either flag, files go to
+local disk as before.
 
 ---
 
@@ -84,7 +99,52 @@ uv run download.py --prefixes-file prefixes.txt --restore
 uv run download.py --prefixes-file prefixes.txt --restore --restore-tier Bulk --restore-days 14
 ```
 
-### NAS / SMB usage
+### MinIO destination
+
+Fill in the `MINIO_*` variables in `.env`, then add `--minio`:
+
+```bash
+# mirror all objects directly into MinIO (no local copy)
+uv run download.py --prefixes-file prefixes.txt --minio
+
+# preview first — see every destination URL without transferring anything
+uv run download.py --prefixes-file prefixes.txt --minio --dry-run
+
+# works with all other flags
+uv run download.py --prefixes-file prefixes.txt --minio --ext pdf,jpg --workers 8
+uv run download.py --prefixes-file prefixes.txt --minio --overwrite
+```
+
+Each object is streamed source S3 → in-memory buffer → MinIO. The key (path)
+is preserved exactly as it exists in the source bucket. If a run is interrupted,
+re-running resumes cleanly — objects already present in MinIO with the correct
+size are skipped.
+
+### Dry run
+
+`--dry-run` works with any destination (`--minio`, `--nas`, or local). It lists
+every object from S3, checks whether it already exists at the destination, and
+prints the fully-resolved destination URL for each object — **nothing is
+downloaded or uploaded**.
+
+```
+[1/64060] → uploads/archive/Tabloid/2026/05/01/Front Page/1/x.png (245,120 B)
+             https://minio-s3.media-meter.com/mediameter/uploads/archive/Tabloid/2026/05/01/Front Page/1/x.png
+
+[2/64060] = uploads/archive/Tabloid/2026/05/01/Front Page/1/x_thumbnail.png (18,432 B, already present — skip)
+             https://minio-s3.media-meter.com/mediameter/uploads/archive/Tabloid/2026/05/01/Front Page/1/x_thumbnail.png
+
+Dry run complete. 58,234 would transfer (~12,450.3 MiB), 5,826 already present (would skip), 64060 total.
+```
+
+Use it to verify the destination paths look correct, estimate how much data
+still needs to transfer, or pipe the output to a file for auditing:
+
+```bash
+uv run download.py --prefixes-file prefixes.txt --minio --dry-run > dry-run.txt
+```
+
+### NAS / SMB destination
 
 Fill in the `NAS_*` variables in `.env`, then add `--nas`:
 
@@ -92,13 +152,13 @@ Fill in the `NAS_*` variables in `.env`, then add `--nas`:
 # write directly to NAS instead of local disk
 uv run download.py --prefixes-file prefixes.txt --nas
 
-# --nas works with all other flags
+# works with all other flags
 uv run download.py --prefixes-file prefixes.txt --nas --ext pdf --workers 8
 uv run download.py --prefixes-file prefixes.txt --nas --overwrite
 ```
 
-Without `--nas` the tool behaves exactly as before — nothing changes for local
-downloads.
+`--nas` and `--minio` cannot be combined. Without either flag, files go to local
+disk as before.
 
 ### `prefixes.txt`
 
@@ -125,7 +185,9 @@ You can list as many prefixes as you need — see [Scaling](#scaling-how-many-pr
 | `--workers N` | Override the auto-picked concurrency (clamped to 32). |
 | `--overwrite` | Re-download every file even if a same-size copy already exists at the destination. |
 | `--ext EXTS` | Only download files with these extensions, comma-separated (e.g. `pdf` or `pdf,jpg`). **Omit to download everything.** |
-| `--nas` | Write files directly to the NAS over SMB/CIFS. Requires `NAS_HOST`, `NAS_USER`, `NAS_PASSWORD`, `NAS_SHARE` in `.env`. |
+| `--minio` | Mirror objects directly into MinIO (no local copy). Requires `MINIO_ENDPOINT_URL`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_ACCESS_KEY`, `MINIO_BUCKET` in `.env`. Mutually exclusive with `--nas`. |
+| `--nas` | Write files directly to the NAS over SMB/CIFS. Requires `NAS_HOST`, `NAS_USER`, `NAS_PASSWORD`, `NAS_SHARE` in `.env`. Mutually exclusive with `--minio`. |
+| `--dry-run` | List every object and print its destination URL without downloading or uploading anything. Works with `--minio`, `--nas`, and local mode. |
 | `--restore` | For GLACIER / DEEP_ARCHIVE objects, initiate a restore so they can be downloaded on a later run. Without it, archived objects are reported and skipped. |
 | `--restore-days N` | How many days a restored copy stays available (default: `7`). |
 | `--restore-tier TIER` | Glacier retrieval tier: `Standard` (default), `Bulk`, or `Expedited`. **`Expedited` is not supported for DEEP_ARCHIVE.** |
